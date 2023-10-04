@@ -40,6 +40,8 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
 
     /// @inheritdoc IUniswapV3PoolImmutables
     address public immutable override factory;
+    /// limitOrderManager to hold liquidity token and to execute Limit order
+    address public limitOrderManager;
     /// @inheritdoc IUniswapV3PoolImmutables
     address public immutable override token0;
     /// @inheritdoc IUniswapV3PoolImmutables
@@ -52,6 +54,15 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
 
     /// @inheritdoc IUniswapV3PoolImmutables
     uint128 public immutable override maxLiquidityPerTick;
+
+    struct LimitOrderData {
+        uint128 liquidity0;
+        uint128 liquidity1;
+        bool filled;
+        bool initialized;
+        uint128 collectToken;
+        uint256 tickFillValue;
+    }
 
     struct Slot0 {
         // the current price
@@ -77,6 +88,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     uint256 public override feeGrowthGlobal0X128;
     /// @inheritdoc IUniswapV3PoolState
     uint256 public override feeGrowthGlobal1X128;
+    int24 public lastTick;
 
     // accumulated protocol fees in token0/token1 units
     struct ProtocolFees {
@@ -95,6 +107,11 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     mapping(int16 => uint256) public override tickBitmap;
     /// @inheritdoc IUniswapV3PoolState
     mapping(bytes32 => Position.Info) public override positions;
+    /// @dev mapping to associate limit orders to ticks and owner
+    mapping(int24 => mapping(address => LimitOrderData)) public limitOrder;
+    mapping(int24 => uint256) public tickFillCount;
+    /// @dev total liquidity at a given tick
+    mapping(int24 => uint256) public limitOrderLiquidity;
     /// @inheritdoc IUniswapV3PoolState
     Oracle.Observation[65535] public override observations;
 
@@ -298,6 +315,114 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         int128 liquidityDelta;
     }
 
+    function createLimitOrder(address recipient, int24 tickLower, uint128 amount) external {
+        require(!limitOrder[tickLower][recipient].initialized || limitOrder[tickLower][recipient].filled, "Previous limit order on this tick must be filled or canceled before placing new limit order");
+
+        int24 tickUpper = tickLower + tickSpacing;
+        LimitOrderData memory limitOrderData;
+        if (slot0.tick < tickLower) {
+            limitOrderData.collectToken = 0;
+            limitOrderData.liquidity1 = amount;
+        } else {
+            limitOrderData.collectToken = 1;
+            limitOrderData.liquidity0 = amount;
+        }
+        limitOrderData.filled = false;
+        limitOrderData.initialized = true;
+        limitOrderData.tickFillValue = tickFillCount[tickLower];
+
+        limitOrder[tickLower][recipient] = limitOrderData;
+
+        // mint liquidity to order manager
+        require(amount > 0);
+        (, int256 amount0Int, int256 amount1Int) =
+            _modifyPosition(
+                ModifyPositionParams({
+                    owner: limitOrderManager,
+                    tickLower: tickLower,
+                    tickUpper: tickUpper,
+                    liquidityDelta: int256(amount).toInt128()
+                })
+            );
+
+        uint256 amount0 = uint256(amount0Int);
+        uint256 amount1 = uint256(amount1Int);
+
+        if(amount0 > 0){
+            TransferHelper.safeTransferFrom(token0, msg.sender,  address(this), amount0);
+        }
+        if(amount1 > 1){
+            TransferHelper.safeTransferFrom(token1, msg.sender,  address(this), amount1);
+        }
+
+        // cumulative liquidity for limit order at a given tick
+        limitOrderLiquidity[tickLower] += amount;
+
+        emit Mint(msg.sender, recipient, tickLower, tickUpper, amount, amount0, amount1);
+    }
+
+    function cancelLimitOrder(address recipient, int24 tickLower) external {
+        require(msg.sender == recipient);
+        
+        LimitOrderData memory limitOrderData = limitOrder[tickLower][recipient];
+
+        require(limitOrderData.tickFillValue == tickFillCount[tickLower], "Filled order cannot be canceled");
+
+        uint128 amount = limitOrderData.liquidity0 + limitOrderData.liquidity1;
+        require(amount > 0, "Order already complete");
+        (, int256 amount0Int, int256 amount1Int) =
+            _modifyPosition(
+                ModifyPositionParams({
+                    owner: limitOrderManager,
+                    tickLower: tickLower,
+                    tickUpper: tickLower + tickSpacing,
+                    liquidityDelta: -int256(amount).toInt128()
+                })
+            );
+
+        delete limitOrder[tickLower][recipient];
+
+        _transfer(token0, recipient, uint256(-amount0Int));
+        _transfer(token1, recipient, uint256(-amount1Int));
+    }
+
+
+    function collectLimitOrder(address recipient, int24 tickLower) external {        
+        int24 tickUpper = tickLower + tickSpacing;
+        LimitOrderData memory limitOrderData = limitOrder[tickLower][recipient];
+
+        require(limitOrderData.tickFillValue < tickFillCount[tickLower], "Order not ready to collect");
+
+        uint128 amount0Requested = uint128(SqrtPriceMath.getAmount0Delta(
+            TickMath.getSqrtRatioAtTick(tickLower),
+            TickMath.getSqrtRatioAtTick(tickUpper),
+            int128(limitOrderData.liquidity1)
+        ));
+        uint128 amount1Requested = uint128(SqrtPriceMath.getAmount1Delta(
+            TickMath.getSqrtRatioAtTick(tickLower),
+            TickMath.getSqrtRatioAtTick(tickUpper),
+            int128(limitOrderData.liquidity0)
+        ));
+
+        Position.Info storage position = positions.get(limitOrderManager, tickLower, tickUpper);
+
+        uint128 amount0 = amount0Requested > position.tokensOwed0 ? position.tokensOwed0 : amount0Requested;
+        uint128 amount1 = amount1Requested > position.tokensOwed1 ? position.tokensOwed1 : amount1Requested;
+
+        if (amount0 > 0) {
+            position.tokensOwed0 -= amount0;
+            TransferHelper.safeTransfer(token0, recipient, amount0);
+        }
+        if (amount1 > 0) {
+            position.tokensOwed1 -= amount1;
+            TransferHelper.safeTransfer(token1, recipient, amount1);
+        }
+
+        limitOrder[tickLower][recipient].filled = true;
+
+        emit Collect(msg.sender, recipient, tickLower, tickUpper, amount0, amount1);
+    }
+
     /// @dev Effect some changes to a position
     /// @param params the position details and the change to the position's liquidity to effect
     /// @return position a storage pointer referencing the position with the given owner and tick range
@@ -461,6 +586,22 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         uint128 amount,
         bytes calldata data
     ) external override lock returns (uint256 amount0, uint256 amount1) {
+        (amount0, amount1) = _mint(
+            recipient,
+            tickLower,
+            tickUpper,
+            amount,
+            data
+        );
+    }
+
+    function _mint(
+        address recipient,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount,
+        bytes memory data
+    ) internal returns(uint256 amount0, uint256 amount1) {
         require(amount > 0);
         (, int256 amount0Int, int256 amount1Int) =
             _modifyPosition(
@@ -494,6 +635,16 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         uint128 amount0Requested,
         uint128 amount1Requested
     ) external override lock returns (uint128 amount0, uint128 amount1) {
+        _collect(recipient, tickLower, tickUpper, amount0Requested, amount1Requested);
+    }
+
+    function _collect(
+        address recipient,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount0Requested,
+        uint128 amount1Requested
+    ) internal returns (uint128 amount0, uint128 amount1) {
         // we don't need to checkTicks here, because invalid positions will never have non-zero tokensOwed{0,1}
         Position.Info storage position = positions.get(msg.sender, tickLower, tickUpper);
 
@@ -693,8 +844,14 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             if (state.sqrtPriceX96 == step.sqrtPriceNextX96) {
                 // if the tick is initialized, run the tick transition
                 if (step.initialized) {
+                    if(step.tickNext != lastTick){
+                        tickFillCount[state.tick]++;
+                    }
+                    
+
                     // check for the placeholder value, which we replace with the actual value the first time the swap
                     // crosses an initialized tick
+                    
                     if (!cache.computedLatestObservation) {
                         (cache.tickCumulative, cache.secondsPerLiquidityCumulativeX128) = observations.observeSingle(
                             cache.blockTimestamp,
@@ -720,6 +877,31 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                     if (zeroForOne) liquidityNet = -liquidityNet;
 
                     state.liquidity = LiquidityMath.addDelta(state.liquidity, liquidityNet);
+                    
+                    if(limitOrderLiquidity[state.tick] > 0 && step.tickNext != lastTick){
+                        lastTick = state.tick;
+                        
+                        (Position.Info storage position, int256 amount0Int, int256 amount1Int) =
+                        _modifyPosition(
+                            ModifyPositionParams({
+                                owner: limitOrderManager,
+                                tickLower: lastTick,
+                                tickUpper: lastTick + tickSpacing,
+                                liquidityDelta: -int256(limitOrderLiquidity[lastTick]).toInt128()
+                            })
+                        );
+
+                        uint256 amount0Owed = uint256(-amount0Int);
+                        uint256 amount1Owed = uint256(-amount1Int);
+
+                        if (amount0Owed > 0 || amount1Owed > 0) {
+                            (position.tokensOwed0, position.tokensOwed1) = (
+                                position.tokensOwed0 + uint128(amount0Owed),
+                                position.tokensOwed1 + uint128(amount1Owed)
+                            );
+                        }
+                        limitOrderLiquidity[lastTick] = 0;
+                    }
                 }
 
                 state.tick = zeroForOne ? step.tickNext - 1 : step.tickNext;
@@ -865,5 +1047,11 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         }
 
         emit CollectProtocol(msg.sender, recipient, amount0, amount1);
+    }
+
+    function _transfer(address token, address to, uint256 value) internal {
+        if (value > 0) {
+            TransferHelper.safeTransfer(token, to, value);
+        }
     }
 }
